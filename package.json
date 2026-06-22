@@ -10,6 +10,9 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
+    "typecheck": "tsc --noEmit --composite false --incremental false -p tsconfig.json && tsc --noEmit --composite false --incremental false -p tsconfig.web.json",
+    "test": "tsc -p tsconfig.test.json && node --test .test-dist/tests/file-system-utils.test.js",
+    "check": "npm run typecheck && npm test && npm run build",
     "start": "electron .",
     "desktop": "npm run build && electron .",
     "preview": "electron-vite preview",

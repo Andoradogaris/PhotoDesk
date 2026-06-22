@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "src/main/file-system-utils.ts",
+    "tests/**/*.ts"
+  ],
+  "compilerOptions": {
+    "composite": false,
+    "incremental": false,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": false,
+    "outDir": ".test-dist",
+    "rootDir": "."
+  }
+}

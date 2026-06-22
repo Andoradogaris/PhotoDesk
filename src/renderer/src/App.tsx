@@ -184,6 +184,9 @@ function LibraryApp(): ReactElement {
   const [metadataManagerOpen, setMetadataManagerOpen] = useState(false)
   const splitRef = useRef<HTMLDivElement | null>(null)
   const restoredLastFolderRef = useRef(false)
+  const detailsRequestRef = useRef(0)
+  const refreshPromiseRef = useRef<Promise<void> | null>(null)
+  const refreshPendingRef = useRef(false)
 
   const selectedNode = useMemo(() => (tree && selectedPath ? findNode(tree, selectedPath) : null), [tree, selectedPath])
   const treeSuggestions = useMemo(() => (tree ? buildMetadataSuggestionsFromTree(tree) : emptySuggestions), [tree])
@@ -200,27 +203,40 @@ function LibraryApp(): ReactElement {
     [tree, selectedPaths]
   )
 
-  const refreshTree = useCallback(async () => {
-    if (!rootPath) return
-    setIsScanning(true)
-    try {
-      const [nextTree, nextSuggestions] = await Promise.all([
-        window.photoDesk.scanFolder(rootPath),
-        window.photoDesk.getMetadataSuggestions(rootPath)
-      ])
-      setTree(nextTree)
-      setCatalogSuggestions(nextSuggestions)
-      setExpanded((previous) => {
-        const next = new Set(previous)
-        next.add(nextTree.path)
-        return next
-      })
-      setStatus('Dossier actualise')
-    } catch (refreshError) {
-      setError(messageFromError(refreshError))
-    } finally {
-      setIsScanning(false)
-    }
+  const refreshTree = useCallback((): Promise<void> => {
+    if (!rootPath) return Promise.resolve()
+    refreshPendingRef.current = true
+    if (refreshPromiseRef.current) return refreshPromiseRef.current
+
+    const refreshPromise = (async (): Promise<void> => {
+      setIsScanning(true)
+      try {
+        while (refreshPendingRef.current) {
+          refreshPendingRef.current = false
+          const [nextTree, nextSuggestions] = await Promise.all([
+            window.photoDesk.scanFolder(rootPath),
+            window.photoDesk.getMetadataSuggestions(rootPath)
+          ])
+          setTree(nextTree)
+          setCatalogSuggestions(nextSuggestions)
+          setExpanded((previous) => {
+            const next = new Set(previous)
+            next.add(nextTree.path)
+            return next
+          })
+        }
+        setStatus('Dossier actualise')
+      } catch (refreshError) {
+        refreshPendingRef.current = false
+        setError(messageFromError(refreshError))
+      } finally {
+        refreshPromiseRef.current = null
+        setIsScanning(false)
+      }
+    })()
+
+    refreshPromiseRef.current = refreshPromise
+    return refreshPromise
   }, [rootPath])
 
   useEffect(() => {
@@ -230,16 +246,18 @@ function LibraryApp(): ReactElement {
   }, [refreshTree])
 
   const loadDetails = useCallback(async (node: FileNode) => {
-    setSelectedPath(node.path)
+    const requestId = ++detailsRequestRef.current
     setError(null)
     try {
       const [nextDetails, nextThumbnail] = await Promise.all([
         window.photoDesk.getItemDetails(node.path),
         window.photoDesk.getThumbnail(node.path)
       ])
+      if (requestId !== detailsRequestRef.current) return
       setDetails(nextDetails)
       setThumbnail(nextThumbnail)
     } catch (detailsError) {
+      if (requestId !== detailsRequestRef.current) return
       setDetails(null)
       setThumbnail(null)
       setError(messageFromError(detailsError))
@@ -256,6 +274,7 @@ function LibraryApp(): ReactElement {
 
   const applyFolderSelection = useCallback(async (result: { rootPath: string; tree: FileNode } | null): Promise<void> => {
     if (!result) return
+    detailsRequestRef.current += 1
     const nextSuggestions = await window.photoDesk.getMetadataSuggestions(result.rootPath)
     setRootPath(result.rootPath)
     setTree(result.tree)
@@ -361,6 +380,14 @@ function LibraryApp(): ReactElement {
     }
     if (selectedPaths.size) return Array.from(selectedPaths)
     return selectedPath ? [selectedPath] : []
+  }
+
+  function requireMutablePaths(node: FileNode | null): string[] {
+    const paths = pathsFor(node)
+    if (rootPath && paths.some((filePath) => filePath === rootPath)) {
+      throw new Error("Le dossier de reference lui-meme ne peut pas etre modifie.")
+    }
+    return paths
   }
 
   function mediaPathsFor(node: FileNode | null): string[] {
@@ -476,14 +503,14 @@ function LibraryApp(): ReactElement {
   }
 
   async function copy(node: FileNode | null): Promise<void> {
-    const selectedPaths = pathsFor(node)
+    const selectedPaths = requireMutablePaths(node)
     if (!selectedPaths.length) return
     setClipboard({ operation: 'copy', paths: selectedPaths })
     setStatus('Element copie')
   }
 
   async function cut(node: FileNode | null): Promise<void> {
-    const selectedPaths = pathsFor(node)
+    const selectedPaths = requireMutablePaths(node)
     if (!selectedPaths.length) return
     setClipboard({ operation: 'cut', paths: selectedPaths })
     setStatus('Element coupe')
@@ -495,30 +522,28 @@ function LibraryApp(): ReactElement {
     if (!targetDir) return
     await window.photoDesk.pasteItems({ ...clipboard, targetDir })
     if (clipboard.operation === 'cut') setClipboard(null)
-    await refreshTree()
   }
 
   async function moveTo(node: FileNode | null): Promise<void> {
-    const selectedPaths = pathsFor(node)
+    const selectedPaths = requireMutablePaths(node)
     if (!selectedPaths.length) return
     const targetDir = await window.photoDesk.selectMoveDestination()
     if (!targetDir) return
     await window.photoDesk.moveItemsTo({ paths: selectedPaths, targetDir })
-    await refreshTree()
   }
 
   async function deleteItems(node: FileNode | null): Promise<void> {
-    const selectedPaths = pathsFor(node)
+    const selectedPaths = requireMutablePaths(node)
     if (!selectedPaths.length) return
     const confirmed = await window.photoDesk.confirmDelete(selectedPaths)
     if (!confirmed) return
     await window.photoDesk.deleteItems(selectedPaths)
+    detailsRequestRef.current += 1
     setSelectedPath(null)
     setSelectedPaths(new Set())
     setSelectionAnchorPath(null)
     setDetails(null)
     setThumbnail(null)
-    await refreshTree()
   }
 
   async function reveal(node: FileNode | null): Promise<void> {
@@ -556,7 +581,6 @@ function LibraryApp(): ReactElement {
     })
     setContextMenu(null)
     setStatus(`Metadonnees mises a jour sur ${result.updatedCount} element(s)`)
-    await refreshTree()
     if (selectedPath) {
       try {
         const [nextDetails, nextThumbnail] = await Promise.all([
@@ -582,7 +606,6 @@ function LibraryApp(): ReactElement {
       confirmLabel: 'Creer',
       onConfirm: async (value) => {
         await window.photoDesk.createFolder({ targetDir, name: value })
-        await refreshTree()
       }
     })
   }
@@ -590,6 +613,10 @@ function LibraryApp(): ReactElement {
   function promptRename(node: FileNode | null): void {
     const target = node ?? selectedNode
     if (!target) return
+    if (target.path === rootPath) {
+      setError("Le dossier de reference lui-meme ne peut pas etre renomme.")
+      return
+    }
     setPrompt({
       title: 'Renommer',
       label: 'Nom',
@@ -600,7 +627,6 @@ function LibraryApp(): ReactElement {
         setSelectedPath(nextPath)
         setSelectedPaths(new Set([nextPath]))
         setSelectionAnchorPath(nextPath)
-        await refreshTree()
       }
     })
   }
@@ -631,10 +657,10 @@ function LibraryApp(): ReactElement {
       const key = event.key.toLowerCase()
       if (event.ctrlKey && key === 'c') {
         event.preventDefault()
-        void copy(null)
+        void runAction(() => copy(null))
       } else if (event.ctrlKey && key === 'x') {
         event.preventDefault()
-        void cut(null)
+        void runAction(() => cut(null))
       } else if (event.ctrlKey && key === 'v') {
         event.preventDefault()
         void runAction(() => paste(selectedNode))
@@ -693,6 +719,11 @@ function LibraryApp(): ReactElement {
   }, [])
 
   const contextMediaNodes = contextMenu ? mediaNodesFor(contextMenu.node) : []
+  const contextTargetNode = contextMenu?.node ?? selectedNode
+  const contextPaths = contextMenu ? pathsFor(contextMenu.node) : []
+  const contextSelectionMutable = Boolean(
+    contextPaths.length && (!rootPath || contextPaths.every((filePath) => filePath !== rootPath))
+  )
 
   return (
     <div className="app-shell">
@@ -815,9 +846,24 @@ function LibraryApp(): ReactElement {
 
       {contextMenu ? (
         <ContextMenu x={contextMenu.x} y={contextMenu.y}>
-          <MenuButton icon={<Eye size={16} />} label="Ouvrir" onClick={() => runAction(() => openNode(contextMenu.node ?? selectedNode!))} />
-          <MenuButton icon={<Copy size={16} />} label="Copier" onClick={() => runAction(() => copy(contextMenu.node))} />
-          <MenuButton icon={<Scissors size={16} />} label="Couper" onClick={() => runAction(() => cut(contextMenu.node))} />
+          <MenuButton
+            icon={<Eye size={16} />}
+            label="Ouvrir"
+            disabled={!contextTargetNode}
+            onClick={() => (contextTargetNode ? runAction(() => openNode(contextTargetNode)) : undefined)}
+          />
+          <MenuButton
+            icon={<Copy size={16} />}
+            label="Copier"
+            disabled={!contextSelectionMutable}
+            onClick={() => runAction(() => copy(contextMenu.node))}
+          />
+          <MenuButton
+            icon={<Scissors size={16} />}
+            label="Couper"
+            disabled={!contextSelectionMutable}
+            onClick={() => runAction(() => cut(contextMenu.node))}
+          />
           <MenuButton
             icon={<Clipboard size={16} />}
             label="Coller"
@@ -839,9 +885,24 @@ function LibraryApp(): ReactElement {
             }}
           />
           <MenuDivider />
-          <MenuButton icon={<Move size={16} />} label="Deplacer vers..." onClick={() => runAction(() => moveTo(contextMenu.node))} />
-          <MenuButton icon={<Edit3 size={16} />} label="Renommer" onClick={() => promptRename(contextMenu.node)} />
-          <MenuButton icon={<Trash2 size={16} />} label="Supprimer" onClick={() => runAction(() => deleteItems(contextMenu.node))} />
+          <MenuButton
+            icon={<Move size={16} />}
+            label="Deplacer vers..."
+            disabled={!contextSelectionMutable}
+            onClick={() => runAction(() => moveTo(contextMenu.node))}
+          />
+          <MenuButton
+            icon={<Edit3 size={16} />}
+            label="Renommer"
+            disabled={!contextSelectionMutable || contextPaths.length !== 1}
+            onClick={() => promptRename(contextMenu.node)}
+          />
+          <MenuButton
+            icon={<Trash2 size={16} />}
+            label="Supprimer"
+            disabled={!contextSelectionMutable}
+            onClick={() => runAction(() => deleteItems(contextMenu.node))}
+          />
           <MenuDivider />
           <MenuButton icon={<FolderPlus size={16} />} label="Nouveau dossier" onClick={() => promptNewFolder(contextMenu.node)} />
           <MenuButton icon={<ExternalLink size={16} />} label="Afficher dans l'explorateur" onClick={() => runAction(() => reveal(contextMenu.node))} />
@@ -879,14 +940,17 @@ function ViewerApp(): ReactElement {
   const [isSaving, setIsSaving] = useState(false)
   const savePromiseRef = useRef<Promise<boolean> | null>(null)
   const closeFlowRef = useRef(false)
+  const fileRequestRef = useRef(0)
 
   const dirty = Boolean(form && savedSnapshot && snapshotForm(form) !== savedSnapshot)
 
   const loadFile = useCallback(async (filePath: string) => {
+    const requestId = ++fileRequestRef.current
     setLoading(true)
     setError(null)
     try {
       const nextDetails = await window.photoDesk.getItemDetails(filePath)
+      if (requestId !== fileRequestRef.current) return
       const nextForm = formFromDetails(nextDetails)
       setDetails(nextDetails)
       setForm(nextForm)
@@ -895,9 +959,12 @@ function ViewerApp(): ReactElement {
       setHistoryIndex(0)
       setStatus('Fichier charge')
     } catch (loadError) {
+      if (requestId !== fileRequestRef.current) return
+      setDetails(null)
+      setForm(null)
       setError(messageFromError(loadError))
     } finally {
-      setLoading(false)
+      if (requestId === fileRequestRef.current) setLoading(false)
     }
   }, [])
 
@@ -1060,13 +1127,13 @@ function ViewerApp(): ReactElement {
     <div className="viewer-shell">
       <header className="viewer-topbar">
         <div className="viewer-nav">
-          <IconButton title="Precedent" onClick={() => void go(-1)} disabled={files.length < 2}>
+          <IconButton title="Precedent" onClick={() => void go(-1)} disabled={loading || files.length < 2}>
             <ArrowLeft size={18} />
           </IconButton>
           <span className="viewer-count">
             {files.length ? index + 1 : 0} / {files.length}
           </span>
-          <IconButton title="Suivant" onClick={() => void go(1)} disabled={files.length < 2}>
+          <IconButton title="Suivant" onClick={() => void go(1)} disabled={loading || files.length < 2}>
             <ArrowRight size={18} />
           </IconButton>
         </div>

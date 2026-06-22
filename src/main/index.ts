@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, shell } from 'electron'
-import type { MenuItemConstructorOptions, MessageBoxOptions, OpenDialogOptions } from 'electron'
+import type { IpcMainInvokeEvent, MenuItemConstructorOptions, MessageBoxOptions, OpenDialogOptions } from 'electron'
 import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
@@ -7,6 +7,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
 import exifr from 'exifr'
 import sharp from 'sharp'
+import {
+  isInside,
+  minimizePathSelection,
+  readJsonFile,
+  runSerialized,
+  samePath,
+  writeJsonFileAtomic
+} from './file-system-utils'
 
 const require = createRequire(import.meta.url)
 const ffprobeStatic = require('ffprobe-static') as { path?: string }
@@ -128,6 +136,7 @@ let activeRootPath: string | null = null
 const viewerStates = new Map<number, ViewerState>()
 const viewerCloseAllowed = new Set<number>()
 const viewerClosePrompting = new Set<number>()
+const approvedMoveDestinations = new Map<number, string>()
 
 const imageExtensions = new Set([
   '.jpg',
@@ -190,7 +199,49 @@ function createWindow(): BrowserWindow {
     win.loadFile(rendererIndex)
   }
 
+  configureSmokeTest(win)
+
   return win
+}
+
+function configureSmokeTest(win: BrowserWindow): void {
+  const resultPath = process.env.PHOTO_DESK_SMOKE_RESULT
+  if (!resultPath) return
+
+  let finished = false
+  const finish = async (result: { ok: boolean; message: string }): Promise<void> => {
+    if (finished) return
+    finished = true
+    await writeJsonFileAtomic(resultPath, result).catch(() => undefined)
+    app.exit(result.ok ? 0 : 1)
+  }
+
+  const timeout = setTimeout(() => {
+    void finish({ ok: false, message: "L'interface ne s'est pas chargee dans le delai imparti." })
+  }, 15_000)
+
+  win.webContents.once('did-fail-load', (_event, errorCode, errorDescription) => {
+    clearTimeout(timeout)
+    void finish({ ok: false, message: `Chargement impossible (${errorCode}) : ${errorDescription}` })
+  })
+
+  win.webContents.once('did-finish-load', () => {
+    setTimeout(() => {
+      void win.webContents
+        .executeJavaScript("document.body.innerText.includes('Photo Desk')")
+        .then((loaded) => {
+          clearTimeout(timeout)
+          return finish({
+            ok: Boolean(loaded),
+            message: loaded ? 'Processus principal, preload et interface charges.' : "Le titre de l'application est absent."
+          })
+        })
+        .catch((error) => {
+          clearTimeout(timeout)
+          return finish({ ok: false, message: error instanceof Error ? error.message : String(error) })
+        })
+    }, 500)
+  })
 }
 
 function buildApplicationMenu(): void {
@@ -311,6 +362,7 @@ function createViewerWindow(state: ViewerState): BrowserWindow {
 
   win.on('closed', () => {
     viewerStates.delete(win.webContents.id)
+    approvedMoveDestinations.delete(win.webContents.id)
     viewerCloseAllowed.delete(win.id)
     viewerClosePrompting.delete(win.id)
   })
@@ -332,17 +384,53 @@ function showMessageBox(options: MessageBoxOptions) {
   return mainWindow ? dialog.showMessageBox(mainWindow, options) : dialog.showMessageBox(options)
 }
 
+function rootPathForEvent(event: IpcMainInvokeEvent): string | null {
+  return viewerStates.get(event.sender.id)?.rootPath ?? (event.sender.id === mainWindow?.webContents.id ? activeRootPath : null)
+}
+
+function requireRootPath(event: IpcMainInvokeEvent, requestedRootPath?: string): string {
+  const rootPath = rootPathForEvent(event)
+  if (!rootPath || (requestedRootPath && !samePath(rootPath, requestedRootPath))) {
+    throw new Error("Cette operation n'est pas autorisee pour le dossier demande.")
+  }
+  return rootPath
+}
+
+function requireLibraryPath(event: IpcMainInvokeEvent, filePath: string, allowRoot = true): string {
+  const rootPath = requireRootPath(event)
+  if (!isInside(filePath, rootPath) || (!allowRoot && samePath(filePath, rootPath))) {
+    throw new Error("Cette operation n'est pas autorisee en dehors du dossier de reference.")
+  }
+  return rootPath
+}
+
+function requireMutableLibraryPaths(event: IpcMainInvokeEvent, pathsToValidate: string[]): { rootPath: string; paths: string[] } {
+  const rootPath = requireRootPath(event)
+  const paths = minimizePathSelection(pathsToValidate)
+  if (!paths.length) throw new Error('Aucun element a modifier.')
+
+  for (const filePath of paths) {
+    if (!isInside(filePath, rootPath)) {
+      throw new Error("Cette operation n'est pas autorisee en dehors du dossier de reference.")
+    }
+    if (samePath(filePath, rootPath)) {
+      throw new Error("Le dossier de reference lui-meme ne peut pas etre modifie.")
+    }
+  }
+
+  return { rootPath, paths }
+}
+
+function runMetadataMutation<T>(rootPath: string, operation: () => Promise<T>): Promise<T> {
+  return runSerialized(path.join(rootPath, metadataDirName), operation)
+}
+
 function getKind(filePath: string, isDirectory: boolean): NodeKind {
   if (isDirectory) return 'folder'
   const extension = path.extname(filePath).toLowerCase()
   if (imageExtensions.has(extension)) return 'image'
   if (videoExtensions.has(extension)) return 'video'
   return 'other'
-}
-
-function isInside(child: string, parent: string): boolean {
-  const relative = path.relative(parent, child)
-  return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative))
 }
 
 function toStoreKey(rootPath: string, filePath: string): string {
@@ -385,9 +473,7 @@ async function readAppSettings(): Promise<AppSettings> {
 }
 
 async function writeAppSettings(settings: AppSettings): Promise<void> {
-  const filePath = appSettingsFilePath()
-  await fs.mkdir(path.dirname(filePath), { recursive: true })
-  await fs.writeFile(filePath, `${JSON.stringify(settings, null, 2)}\n`, 'utf-8')
+  await writeJsonFileAtomic(appSettingsFilePath(), settings)
 }
 
 async function saveLastReferenceFolder(rootPath: string): Promise<void> {
@@ -398,23 +484,15 @@ async function saveLastReferenceFolder(rootPath: string): Promise<void> {
 }
 
 async function readMetadataStore(rootPath: string): Promise<MetadataStore> {
-  const filePath = metadataFilePath(rootPath)
-  if (!(await pathExists(filePath))) {
-    return {}
+  const store = await readJsonFile<unknown>(metadataFilePath(rootPath), {})
+  if (!store || typeof store !== 'object' || Array.isArray(store)) {
+    throw new Error('Le fichier de metadonnees ne contient pas un objet valide.')
   }
-
-  try {
-    const raw = await fs.readFile(filePath, 'utf-8')
-    return JSON.parse(raw) as MetadataStore
-  } catch {
-    return {}
-  }
+  return store as MetadataStore
 }
 
 async function writeMetadataStore(rootPath: string, store: MetadataStore): Promise<void> {
-  const dir = path.join(rootPath, metadataDirName)
-  await fs.mkdir(dir, { recursive: true })
-  await fs.writeFile(metadataFilePath(rootPath), `${JSON.stringify(store, null, 2)}\n`, 'utf-8')
+  await writeJsonFileAtomic(metadataFilePath(rootPath), store)
 }
 
 function emptyMetadataSuggestions(): MetadataSuggestions {
@@ -436,23 +514,15 @@ function emptyUsageCounts(): MetadataUsageCounts {
 }
 
 async function readMetadataCatalog(rootPath: string): Promise<MetadataSuggestions> {
-  const filePath = catalogFilePath(rootPath)
-  if (!(await pathExists(filePath))) {
-    return emptyMetadataSuggestions()
+  const catalog = await readJsonFile<unknown>(catalogFilePath(rootPath), emptyMetadataSuggestions())
+  if (!catalog || typeof catalog !== 'object' || Array.isArray(catalog)) {
+    throw new Error('Le fichier de referentiels ne contient pas un objet valide.')
   }
-
-  try {
-    const raw = await fs.readFile(filePath, 'utf-8')
-    return cleanCatalog(JSON.parse(raw) as Partial<MetadataSuggestions>)
-  } catch {
-    return emptyMetadataSuggestions()
-  }
+  return cleanCatalog(catalog as Partial<MetadataSuggestions>)
 }
 
 async function writeMetadataCatalog(rootPath: string, catalog: MetadataSuggestions): Promise<void> {
-  const dir = path.join(rootPath, metadataDirName)
-  await fs.mkdir(dir, { recursive: true })
-  await fs.writeFile(catalogFilePath(rootPath), `${JSON.stringify(cleanCatalog(catalog), null, 2)}\n`, 'utf-8')
+  await writeJsonFileAtomic(catalogFilePath(rootPath), cleanCatalog(catalog))
 }
 
 function cleanCatalog(catalog: Partial<MetadataSuggestions>): MetadataSuggestions {
@@ -508,11 +578,18 @@ async function getCustomMetadata(rootPath: string | null, filePath: string): Pro
 }
 
 async function saveCustomMetadata(rootPath: string, filePath: string, metadata: CustomMetadata): Promise<void> {
-  const store = await readMetadataStore(rootPath)
-  const cleanedMetadata = cleanMetadata(metadata)
-  store[toStoreKey(rootPath, filePath)] = cleanedMetadata
-  await writeMetadataStore(rootPath, store)
-  await addMetadataValuesToCatalog(rootPath, cleanedMetadata)
+  await runMetadataMutation(rootPath, async () => {
+    const store = await readMetadataStore(rootPath)
+    const cleanedMetadata = cleanMetadata(metadata)
+    const key = toStoreKey(rootPath, filePath)
+    if (Object.keys(cleanedMetadata).length) {
+      store[key] = cleanedMetadata
+    } else {
+      delete store[key]
+    }
+    await writeMetadataStore(rootPath, store)
+    await addMetadataValuesToCatalog(rootPath, cleanedMetadata)
+  })
 }
 
 async function addMetadataValuesToCatalog(rootPath: string, metadata: CustomMetadata): Promise<void> {
@@ -596,9 +673,11 @@ async function addMetadataCatalogValue(
   category: MetadataCategory,
   value: string
 ): Promise<MetadataCatalogData> {
-  const catalog = await readMetadataCatalog(rootPath)
-  await writeMetadataCatalog(rootPath, addCatalogValue(catalog, category, value))
-  return getMetadataCatalogData(rootPath)
+  return runMetadataMutation(rootPath, async () => {
+    const catalog = await readMetadataCatalog(rootPath)
+    await writeMetadataCatalog(rootPath, addCatalogValue(catalog, category, value))
+    return getMetadataCatalogData(rootPath)
+  })
 }
 
 async function renameMetadataCatalogValue(
@@ -608,20 +687,22 @@ async function renameMetadataCatalogValue(
   to: string,
   updateFiles: boolean
 ): Promise<MetadataCatalogData> {
-  const cleanTo = to.trim()
-  if (!cleanTo) throw new Error('La nouvelle valeur ne peut pas etre vide.')
+  return runMetadataMutation(rootPath, async () => {
+    const cleanTo = to.trim()
+    if (!cleanTo) throw new Error('La nouvelle valeur ne peut pas etre vide.')
 
-  const catalog = removeCatalogValue(await readMetadataCatalog(rootPath), category, from)
-  await writeMetadataCatalog(rootPath, addCatalogValue(catalog, category, cleanTo))
+    const catalog = removeCatalogValue(await readMetadataCatalog(rootPath), category, from)
+    await writeMetadataCatalog(rootPath, addCatalogValue(catalog, category, cleanTo))
 
-  if (updateFiles) {
-    const store = await readMetadataStore(rootPath)
-    const changed = updateMetadataStoreValues(store, category, from, cleanTo)
-    if (changed) await writeMetadataStore(rootPath, store)
-    if (changed) broadcastLibraryRefresh()
-  }
+    if (updateFiles) {
+      const store = await readMetadataStore(rootPath)
+      const changed = updateMetadataStoreValues(store, category, from, cleanTo)
+      if (changed) await writeMetadataStore(rootPath, store)
+      if (changed) broadcastLibraryRefresh()
+    }
 
-  return getMetadataCatalogData(rootPath)
+    return getMetadataCatalogData(rootPath)
+  })
 }
 
 async function deleteMetadataCatalogValue(
@@ -630,16 +711,18 @@ async function deleteMetadataCatalogValue(
   value: string,
   removeFromFiles: boolean
 ): Promise<MetadataCatalogData> {
-  await writeMetadataCatalog(rootPath, removeCatalogValue(await readMetadataCatalog(rootPath), category, value))
+  return runMetadataMutation(rootPath, async () => {
+    await writeMetadataCatalog(rootPath, removeCatalogValue(await readMetadataCatalog(rootPath), category, value))
 
-  if (removeFromFiles) {
-    const store = await readMetadataStore(rootPath)
-    const changed = removeMetadataStoreValues(store, category, value)
-    if (changed) await writeMetadataStore(rootPath, store)
-    if (changed) broadcastLibraryRefresh()
-  }
+    if (removeFromFiles) {
+      const store = await readMetadataStore(rootPath)
+      const changed = removeMetadataStoreValues(store, category, value)
+      if (changed) await writeMetadataStore(rootPath, store)
+      if (changed) broadcastLibraryRefresh()
+    }
 
-  return getMetadataCatalogData(rootPath)
+    return getMetadataCatalogData(rootPath)
+  })
 }
 
 async function addMetadataToFiles(payload: BulkMetadataAddPayload) {
@@ -653,6 +736,10 @@ async function addMetadataToFiles(payload: BulkMetadataAddPayload) {
 }
 
 async function updateMetadataForFiles(payload: BulkMetadataUpdatePayload) {
+  return runMetadataMutation(payload.rootPath, () => updateMetadataForFilesUnlocked(payload))
+}
+
+async function updateMetadataForFilesUnlocked(payload: BulkMetadataUpdatePayload) {
   const addValues = Array.from(uniqueMetadataValues(payload.addValues))
   const addValueKeys = new Set(addValues.map((value) => normalizeMetadataValue(value)))
   const removeValues = Array.from(uniqueMetadataValues(payload.removeValues)).filter(
@@ -1011,10 +1098,10 @@ async function getVideoInfo(filePath: string): Promise<Record<string, unknown>> 
   })
 }
 
-async function getItemDetails(filePath: string) {
+async function getItemDetails(filePath: string, libraryRootPath: string | null = activeRootPath) {
   const stat = await fs.stat(filePath)
   const kind = getKind(filePath, stat.isDirectory())
-  const rootPath = activeRootPath && isInside(filePath, activeRootPath) ? activeRootPath : null
+  const rootPath = libraryRootPath && isInside(filePath, libraryRootPath) ? libraryRootPath : null
   const media = kind === 'image' ? await getImageInfo(filePath) : kind === 'video' ? await getVideoInfo(filePath) : {}
 
   return {
@@ -1106,25 +1193,25 @@ async function transferMetadata(rootPath: string | null, sourcePath: string, des
     return
   }
 
-  const store = await readMetadataStore(rootPath)
-  const sourceKey = toStoreKey(rootPath, sourcePath)
-  const destinationKey = toStoreKey(rootPath, destinationPath)
-  let changed = false
+  await runMetadataMutation(rootPath, async () => {
+    const store = await readMetadataStore(rootPath)
+    const sourceKey = toStoreKey(rootPath, sourcePath)
+    const destinationKey = toStoreKey(rootPath, destinationPath)
+    let changed = false
 
-  for (const key of Object.keys(store)) {
-    if (key === sourceKey || key.startsWith(`${sourceKey}/`)) {
-      const nextKey = `${destinationKey}${key.slice(sourceKey.length)}`
-      store[nextKey] = store[key]
-      if (operation === 'cut') {
-        delete store[key]
+    for (const key of Object.keys(store)) {
+      if (key === sourceKey || key.startsWith(`${sourceKey}/`)) {
+        const nextKey = `${destinationKey}${key.slice(sourceKey.length)}`
+        store[nextKey] = store[key]
+        if (operation === 'cut') {
+          delete store[key]
+        }
+        changed = true
       }
-      changed = true
     }
-  }
 
-  if (changed) {
-    await writeMetadataStore(rootPath, store)
-  }
+    if (changed) await writeMetadataStore(rootPath, store)
+  })
 }
 
 async function removeMetadata(rootPath: string | null, removedPath: string): Promise<void> {
@@ -1132,20 +1219,20 @@ async function removeMetadata(rootPath: string | null, removedPath: string): Pro
     return
   }
 
-  const store = await readMetadataStore(rootPath)
-  const removedKey = toStoreKey(rootPath, removedPath)
-  let changed = false
+  await runMetadataMutation(rootPath, async () => {
+    const store = await readMetadataStore(rootPath)
+    const removedKey = toStoreKey(rootPath, removedPath)
+    let changed = false
 
-  for (const key of Object.keys(store)) {
-    if (key === removedKey || key.startsWith(`${removedKey}/`)) {
-      delete store[key]
-      changed = true
+    for (const key of Object.keys(store)) {
+      if (key === removedKey || key.startsWith(`${removedKey}/`)) {
+        delete store[key]
+        changed = true
+      }
     }
-  }
 
-  if (changed) {
-    await writeMetadataStore(rootPath, store)
-  }
+    if (changed) await writeMetadataStore(rootPath, store)
+  })
 }
 
 async function rotateImageFile(filePath: string, degrees: number): Promise<void> {
@@ -1240,7 +1327,7 @@ async function saveMediaEdits(payload: SaveEditsPayload) {
 
   return {
     path: currentPath,
-    details: await getItemDetails(currentPath)
+    details: await getItemDetails(currentPath, rootPath)
   }
 }
 
@@ -1291,14 +1378,20 @@ ipcMain.handle('folder:last', async () => {
   return getLastReferenceFolder()
 })
 
-ipcMain.handle('folder:scan', async (_event, rootPath: string) => {
-  activeRootPath = rootPath
+ipcMain.handle('folder:scan', async (event, rootPath: string) => {
+  requireRootPath(event, rootPath)
   await saveLastReferenceFolder(rootPath)
   return buildTree(rootPath)
 })
 
-ipcMain.handle('metadata:suggestions', async (_event, rootPath: string) => getMetadataSuggestions(rootPath))
-ipcMain.handle('metadata:catalog', async (_event, rootPath: string) => getMetadataCatalogData(rootPath))
+ipcMain.handle('metadata:suggestions', async (event, rootPath: string) => {
+  requireRootPath(event, rootPath)
+  return getMetadataSuggestions(rootPath)
+})
+ipcMain.handle('metadata:catalog', async (event, rootPath: string) => {
+  requireRootPath(event, rootPath)
+  return getMetadataCatalogData(rootPath)
+})
 ipcMain.handle(
   'metadata:confirm-bulk-add',
   async (event, payload: { category: BulkMetadataCategory; values: string[]; count: number }) => {
@@ -1357,25 +1450,38 @@ ipcMain.handle(
     return result.response === 0
   }
 )
-ipcMain.handle('metadata:bulk-add', async (_event, payload: BulkMetadataAddPayload) => addMetadataToFiles(payload))
-ipcMain.handle('metadata:bulk-update', async (_event, payload: BulkMetadataUpdatePayload) => updateMetadataForFiles(payload))
+ipcMain.handle('metadata:bulk-add', async (event, payload: BulkMetadataAddPayload) => {
+  requireRootPath(event, payload.rootPath)
+  return addMetadataToFiles({ ...payload, paths: requireMutableLibraryPaths(event, payload.paths).paths })
+})
+ipcMain.handle('metadata:bulk-update', async (event, payload: BulkMetadataUpdatePayload) => {
+  requireRootPath(event, payload.rootPath)
+  return updateMetadataForFiles({ ...payload, paths: requireMutableLibraryPaths(event, payload.paths).paths })
+})
 ipcMain.handle(
   'metadata:catalog-add',
-  async (_event, payload: { rootPath: string; category: MetadataCategory; value: string }) =>
-    addMetadataCatalogValue(payload.rootPath, payload.category, payload.value)
+  async (event, payload: { rootPath: string; category: MetadataCategory; value: string }) => {
+    requireRootPath(event, payload.rootPath)
+    return addMetadataCatalogValue(payload.rootPath, payload.category, payload.value)
+  }
 )
 ipcMain.handle(
   'metadata:catalog-rename',
-  async (_event, payload: { rootPath: string; category: MetadataCategory; from: string; to: string; updateFiles: boolean }) =>
-    renameMetadataCatalogValue(payload.rootPath, payload.category, payload.from, payload.to, payload.updateFiles)
+  async (event, payload: { rootPath: string; category: MetadataCategory; from: string; to: string; updateFiles: boolean }) => {
+    requireRootPath(event, payload.rootPath)
+    return renameMetadataCatalogValue(payload.rootPath, payload.category, payload.from, payload.to, payload.updateFiles)
+  }
 )
 ipcMain.handle(
   'metadata:catalog-delete',
-  async (_event, payload: { rootPath: string; category: MetadataCategory; value: string; removeFromFiles: boolean }) =>
-    deleteMetadataCatalogValue(payload.rootPath, payload.category, payload.value, payload.removeFromFiles)
+  async (event, payload: { rootPath: string; category: MetadataCategory; value: string; removeFromFiles: boolean }) => {
+    requireRootPath(event, payload.rootPath)
+    return deleteMetadataCatalogValue(payload.rootPath, payload.category, payload.value, payload.removeFromFiles)
+  }
 )
 
-ipcMain.handle('folder:create', async (_event, payload: { targetDir: string; name: string }) => {
+ipcMain.handle('folder:create', async (event, payload: { targetDir: string; name: string }) => {
+  requireLibraryPath(event, payload.targetDir)
   const name = sanitizeFileName(payload.name) || 'Nouveau dossier'
   const targetPath = await uniqueTargetPath(payload.targetDir, name)
   await fs.mkdir(targetPath)
@@ -1383,18 +1489,27 @@ ipcMain.handle('folder:create', async (_event, payload: { targetDir: string; nam
   return targetPath
 })
 
-ipcMain.handle('item:details', async (_event, filePath: string) => getItemDetails(filePath))
-ipcMain.handle('item:thumbnail', async (_event, filePath: string) => getThumbnail(filePath))
+ipcMain.handle('item:details', async (event, filePath: string) => {
+  const rootPath = requireLibraryPath(event, filePath)
+  return getItemDetails(filePath, rootPath)
+})
+ipcMain.handle('item:thumbnail', async (event, filePath: string) => {
+  requireLibraryPath(event, filePath)
+  return getThumbnail(filePath)
+})
 
-ipcMain.handle('item:open-external', async (_event, filePath: string) => {
+ipcMain.handle('item:open-external', async (event, filePath: string) => {
+  requireLibraryPath(event, filePath)
   return shell.openPath(filePath)
 })
 
-ipcMain.handle('item:reveal', async (_event, filePath: string) => {
+ipcMain.handle('item:reveal', async (event, filePath: string) => {
+  requireLibraryPath(event, filePath)
   shell.showItemInFolder(filePath)
 })
 
-ipcMain.handle('item:rename', async (_event, payload: { filePath: string; name: string }) => {
+ipcMain.handle('item:rename', async (event, payload: { filePath: string; name: string }) => {
+  const rootPath = requireLibraryPath(event, payload.filePath, false)
   const nextName = normalizeRenamedFileName(payload.filePath, payload.name)
   const nextPath = path.join(path.dirname(payload.filePath), nextName)
   if (nextPath === payload.filePath) {
@@ -1406,15 +1521,18 @@ ipcMain.handle('item:rename', async (_event, payload: { filePath: string; name: 
   }
 
   await movePath(payload.filePath, nextPath)
-  await transferMetadata(activeRootPath, payload.filePath, nextPath, 'cut')
+  await transferMetadata(rootPath, payload.filePath, nextPath, 'cut')
   broadcastLibraryRefresh()
   return nextPath
 })
 
-ipcMain.handle('items:paste', async (_event, payload: PastePayload) => {
-  for (const sourcePath of payload.paths) {
-    if (payload.operation === 'cut' && isInside(payload.targetDir, sourcePath)) {
-      throw new Error('Impossible de deplacer un dossier dans lui-meme.')
+ipcMain.handle('items:paste', async (event, payload: PastePayload) => {
+  const { rootPath, paths } = requireMutableLibraryPaths(event, payload.paths)
+  requireLibraryPath(event, payload.targetDir)
+
+  for (const sourcePath of paths) {
+    if (isInside(payload.targetDir, sourcePath)) {
+      throw new Error('Impossible de copier ou de deplacer un dossier dans lui-meme.')
     }
 
     const destinationPath = await uniqueTargetPath(payload.targetDir, path.basename(sourcePath))
@@ -1423,32 +1541,40 @@ ipcMain.handle('items:paste', async (_event, payload: PastePayload) => {
     } else {
       await movePath(sourcePath, destinationPath)
     }
-    await transferMetadata(activeRootPath, sourcePath, destinationPath, payload.operation)
+    await transferMetadata(rootPath, sourcePath, destinationPath, payload.operation)
   }
 
   broadcastLibraryRefresh()
   return true
 })
 
-ipcMain.handle('items:move-to', async (_event, payload: { paths: string[]; targetDir: string }) => {
-  for (const sourcePath of payload.paths) {
+ipcMain.handle('items:move-to', async (event, payload: { paths: string[]; targetDir: string }) => {
+  const { rootPath, paths } = requireMutableLibraryPaths(event, payload.paths)
+  const approvedDestination = approvedMoveDestinations.get(event.sender.id)
+  approvedMoveDestinations.delete(event.sender.id)
+  if (!approvedDestination || !samePath(approvedDestination, payload.targetDir)) {
+    throw new Error("Le dossier de destination n'a pas ete confirme.")
+  }
+
+  for (const sourcePath of paths) {
     if (isInside(payload.targetDir, sourcePath)) {
       throw new Error('Impossible de deplacer un dossier dans lui-meme.')
     }
 
     const destinationPath = await uniqueTargetPath(payload.targetDir, path.basename(sourcePath))
     await movePath(sourcePath, destinationPath)
-    await transferMetadata(activeRootPath, sourcePath, destinationPath, 'cut')
+    await transferMetadata(rootPath, sourcePath, destinationPath, 'cut')
   }
 
   broadcastLibraryRefresh()
   return true
 })
 
-ipcMain.handle('items:delete', async (_event, pathsToDelete: string[]) => {
-  for (const filePath of pathsToDelete) {
+ipcMain.handle('items:delete', async (event, pathsToDelete: string[]) => {
+  const { rootPath, paths } = requireMutableLibraryPaths(event, pathsToDelete)
+  for (const filePath of paths) {
     await shell.trashItem(filePath)
-    await removeMetadata(activeRootPath, filePath)
+    await removeMetadata(rootPath, filePath)
   }
 
   broadcastLibraryRefresh()
@@ -1469,16 +1595,18 @@ ipcMain.handle('dialog:confirm-delete', async (_event, pathsToDelete: string[]) 
   return result.response === 0
 })
 
-ipcMain.handle('dialog:select-destination', async () => {
+ipcMain.handle('dialog:select-destination', async (event) => {
   const result = await showOpenDialog({
     title: 'Choisir le dossier de destination',
     properties: ['openDirectory']
   })
 
   if (result.canceled || !result.filePaths[0]) {
+    approvedMoveDestinations.delete(event.sender.id)
     return null
   }
 
+  approvedMoveDestinations.set(event.sender.id, result.filePaths[0])
   return result.filePaths[0]
 })
 
@@ -1499,8 +1627,16 @@ ipcMain.handle('dialog:confirm-save', async (event) => {
   return 'cancel'
 })
 
-ipcMain.handle('viewer:open', async (_event, payload: ViewerState) => {
-  createViewerWindow(payload)
+ipcMain.handle('viewer:open', async (event, payload: ViewerState) => {
+  const rootPath = requireRootPath(event, payload.rootPath)
+  const files = payload.files.filter(
+    (filePath, index, allFiles) =>
+      isInside(filePath, rootPath) && allFiles.findIndex((candidate) => samePath(candidate, filePath)) === index
+  )
+  if (!files.length || !files.some((filePath) => samePath(filePath, payload.currentPath))) {
+    throw new Error('La selection de la visionneuse est invalide.')
+  }
+  createViewerWindow({ rootPath, files, currentPath: payload.currentPath })
   return true
 })
 
@@ -1524,7 +1660,11 @@ ipcMain.handle('viewer:close-cancelled', async (event) => {
   }
 })
 
-ipcMain.handle('media:save-edits', async (_event, payload: SaveEditsPayload) => saveMediaEdits(payload))
+ipcMain.handle('media:save-edits', async (event, payload: SaveEditsPayload) => {
+  requireRootPath(event, payload.rootPath)
+  requireLibraryPath(event, payload.originalPath, false)
+  return saveMediaEdits(payload)
+})
 
 app.whenReady().then(() => {
   buildApplicationMenu()
