@@ -166,12 +166,13 @@ export interface PhotoDeskApi {
   confirmSave(): Promise<SaveChoice>
   openViewer(payload: ViewerState): Promise<boolean>
   getViewerState(): Promise<ViewerState | null>
-  closeViewer(): Promise<void>
+  closeViewer(currentPath?: string): Promise<void>
   cancelViewerClose(): Promise<void>
   saveMediaEdits(payload: SaveEditsPayload): Promise<{ path: string; details: MediaDetails }>
   onChooseReferenceFolder(callback: () => void): () => void
   onOpenMetadataManager(callback: () => void): () => void
   onReferenceFolderSelected(callback: (payload: { rootPath: string; tree: FileNode }) => void): () => void
   onLibraryRefresh(callback: () => void): () => void
+  onLibrarySelectPath(callback: (filePath: string) => void): () => void
   onViewerAttemptClose(callback: () => void): () => void
 }

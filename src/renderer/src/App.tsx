@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent, ReactElement, ReactNode } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent, MutableRefObject, ReactElement, ReactNode } from 'react'
 import {
   ArrowLeft,
   ArrowRight,
@@ -19,6 +19,7 @@ import {
   FolderPlus,
   Heart,
   Image,
+  Moon,
   MapPin,
   Maximize2,
   Move,
@@ -30,6 +31,7 @@ import {
   Scissors,
   Search,
   Star,
+  Sun,
   Tag,
   Trash2,
   Users,
@@ -122,6 +124,19 @@ interface FilterState {
   status: string
   minRating: number
   favoritesOnly: boolean
+  withoutTags: boolean
+  withoutPeople: boolean
+  withoutLocations: boolean
+}
+
+type ThemeMode = 'light' | 'dark'
+type ExplorerViewMode = 'tree' | 'mosaic'
+type SortField = 'name' | 'modifiedAt' | 'kind' | 'size'
+type SortDirection = 'asc' | 'desc'
+
+interface SortState {
+  field: SortField
+  direction: SortDirection
 }
 
 const statusOptions = ['A trier', 'A garder', 'A retoucher', 'Archive', 'Rejete']
@@ -140,8 +155,12 @@ const defaultFilters: FilterState = {
   locationsText: '',
   status: '',
   minRating: 0,
-  favoritesOnly: false
+  favoritesOnly: false,
+  withoutTags: false,
+  withoutPeople: false,
+  withoutLocations: false
 }
+const defaultSort: SortState = { field: 'name', direction: 'asc' }
 
 const categoryConfigs: Record<MetadataCategory, MetadataCategoryConfig> = {
   tags: { label: 'Tags', singular: 'tag', empty: 'Aucun tag', icon: <Tag size={16} /> },
@@ -157,12 +176,38 @@ const bulkCategoryConfigs: Record<BulkMetadataCategory, BulkMetadataCategoryConf
 }
 const bulkMetadataCategories: BulkMetadataCategory[] = ['tags', 'people', 'locations']
 
-export function App(): ReactElement {
-  const isViewer = window.location.hash.startsWith('#/viewer')
-  return isViewer ? <ViewerApp /> : <LibraryApp />
+function useAppTheme(): [ThemeMode, () => void] {
+  const [theme, setTheme] = useState<ThemeMode>(() => {
+    try {
+      return window.localStorage.getItem('photoDesk.theme') === 'dark' ? 'dark' : 'light'
+    } catch {
+      return 'light'
+    }
+  })
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme
+    try {
+      window.localStorage.setItem('photoDesk.theme', theme)
+    } catch {
+      // The theme still applies for the current window if persistence is unavailable.
+    }
+  }, [theme])
+
+  const toggleTheme = useCallback(() => {
+    setTheme((current) => (current === 'dark' ? 'light' : 'dark'))
+  }, [])
+
+  return [theme, toggleTheme]
 }
 
-function LibraryApp(): ReactElement {
+export function App(): ReactElement {
+  const [theme, toggleTheme] = useAppTheme()
+  const isViewer = window.location.hash.startsWith('#/viewer')
+  return isViewer ? <ViewerApp /> : <LibraryApp theme={theme} onToggleTheme={toggleTheme} />
+}
+
+function LibraryApp({ theme, onToggleTheme }: { theme: ThemeMode; onToggleTheme: () => void }): ReactElement {
   const [rootPath, setRootPath] = useState<string | null>(null)
   const [tree, setTree] = useState<FileNode | null>(null)
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
@@ -180,6 +225,8 @@ function LibraryApp(): ReactElement {
   const [rowHeight, setRowHeight] = useState(34)
   const [isScanning, setIsScanning] = useState(false)
   const [filters, setFilters] = useState<FilterState>(defaultFilters)
+  const [sort, setSort] = useState<SortState>(defaultSort)
+  const [viewMode, setViewMode] = useState<ExplorerViewMode>('tree')
   const [catalogSuggestions, setCatalogSuggestions] = useState<MetadataSuggestions>(emptySuggestions)
   const [metadataManagerOpen, setMetadataManagerOpen] = useState(false)
   const splitRef = useRef<HTMLDivElement | null>(null)
@@ -187,6 +234,7 @@ function LibraryApp(): ReactElement {
   const detailsRequestRef = useRef(0)
   const refreshPromiseRef = useRef<Promise<void> | null>(null)
   const refreshPendingRef = useRef(false)
+  const pendingSelectPathRef = useRef<string | null>(null)
 
   const selectedNode = useMemo(() => (tree && selectedPath ? findNode(tree, selectedPath) : null), [tree, selectedPath])
   const treeSuggestions = useMemo(() => (tree ? buildMetadataSuggestionsFromTree(tree) : emptySuggestions), [tree])
@@ -195,8 +243,9 @@ function LibraryApp(): ReactElement {
     [treeSuggestions, catalogSuggestions]
   )
   const filteredTree = useMemo(() => (tree ? filterTree(tree, filters) : null), [tree, filters])
-  const visibleNodes = useMemo(() => (filteredTree ? flattenVisibleNodes(filteredTree, expanded) : []), [filteredTree, expanded])
-  const mediaFiles = useMemo(() => (filteredTree ? flattenMediaFiles(filteredTree) : []), [filteredTree])
+  const sortedTree = useMemo(() => (filteredTree ? sortTree(filteredTree, sort) : null), [filteredTree, sort])
+  const visibleNodes = useMemo(() => (sortedTree ? flattenVisibleNodes(sortedTree, expanded) : []), [sortedTree, expanded])
+  const mediaFiles = useMemo(() => (sortedTree ? flattenMediaFiles(sortedTree) : []), [sortedTree])
   const activeFilterCount = useMemo(() => countActiveFilters(filters), [filters])
   const selectedNodes = useMemo(
     () => (tree ? Array.from(selectedPaths).map((filePath) => findNode(tree, filePath)).filter((node): node is FileNode => Boolean(node)) : []),
@@ -263,6 +312,46 @@ function LibraryApp(): ReactElement {
       setError(messageFromError(detailsError))
     }
   }, [])
+
+  const selectPathInTree = useCallback(
+    (filePath: string): boolean => {
+      if (!tree) return false
+      const chain = findNodeChain(tree, filePath)
+      if (!chain) return false
+      const node = chain[chain.length - 1]
+
+      setExpanded((previous) => {
+        const next = new Set(previous)
+        for (const item of chain) {
+          if (item.kind === 'folder') next.add(item.path)
+        }
+        return next
+      })
+      setSelectedPath(node.path)
+      setSelectedPaths(new Set([node.path]))
+      setSelectionAnchorPath(node.path)
+      void loadDetails(node)
+      scrollNodeIntoView(node.path)
+      return true
+    },
+    [tree, loadDetails]
+  )
+
+  useEffect(() => {
+    return window.photoDesk.onLibrarySelectPath((filePath) => {
+      pendingSelectPathRef.current = filePath
+      if (selectPathInTree(filePath)) {
+        pendingSelectPathRef.current = null
+      }
+    })
+  }, [selectPathInTree])
+
+  useEffect(() => {
+    const filePath = pendingSelectPathRef.current
+    if (filePath && selectPathInTree(filePath)) {
+      pendingSelectPathRef.current = null
+    }
+  }, [selectPathInTree, tree])
 
   const handleMetadataManagerChanged = useCallback(
     (suggestions: MetadataSuggestions) => {
@@ -500,6 +589,13 @@ function LibraryApp(): ReactElement {
         selectSingleNode(node)
       }
     }
+  }
+
+  function changeSort(field: SortField): void {
+    setSort((current) => ({
+      field,
+      direction: current.field === field && current.direction === 'asc' ? 'desc' : 'asc'
+    }))
   }
 
   async function copy(node: FileNode | null): Promise<void> {
@@ -749,6 +845,9 @@ function LibraryApp(): ReactElement {
             <Tag size={18} />
             <span>Referentiels</span>
           </IconButton>
+          <IconButton title={theme === 'dark' ? 'Mode clair' : 'Mode sombre'} onClick={onToggleTheme}>
+            {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
+          </IconButton>
           <label className="density-control" title="Taille des lignes">
             <Maximize2 size={16} />
             <input
@@ -787,27 +886,48 @@ function LibraryApp(): ReactElement {
 
           <div className="file-grid" style={{ ['--row-height' as string]: `${rowHeight}px` }}>
             <div className="file-grid-head">
-              <span>Nom</span>
-              <span>Modification</span>
-              <span>Type</span>
-              <span>Taille</span>
+              <SortHeaderButton field="name" label="Nom" sort={sort} onClick={changeSort} />
+              <SortHeaderButton field="modifiedAt" label="Modification" sort={sort} onClick={changeSort} />
+              <SortHeaderButton field="kind" label="Type" sort={sort} onClick={changeSort} />
+              <SortHeaderButton field="size" label="Taille" sort={sort} onClick={changeSort} />
             </div>
-            <div className="file-grid-body" onContextMenu={(event) => openContextMenu(event, null)}>
+            <div
+              className={`file-grid-body ${viewMode === 'mosaic' ? 'mosaic-body' : ''}`}
+              onContextMenu={(event) => openContextMenu(event, null)}
+            >
               {visibleNodes.length ? (
-                visibleNodes.map(({ node, depth }) => (
-                  <ExplorerRow
-                    key={node.path}
-                    node={node}
-                    depth={depth}
-                    expanded={expanded.has(node.path)}
-                    selected={selectedPaths.has(node.path)}
-                    clipboardMode={clipboard?.paths.includes(node.path) ? clipboard.operation : null}
-                    onSelect={(event) => selectNode(node, event)}
-                    onOpen={() => void openNode(node)}
-                    onToggle={() => toggleFolder(node)}
-                    onContextMenu={(event) => openContextMenu(event, node)}
-                  />
-                ))
+                viewMode === 'tree' ? (
+                  visibleNodes.map(({ node, depth }) => (
+                    <ExplorerRow
+                      key={node.path}
+                      node={node}
+                      depth={depth}
+                      expanded={expanded.has(node.path)}
+                      selected={selectedPaths.has(node.path)}
+                      clipboardMode={clipboard?.paths.includes(node.path) ? clipboard.operation : null}
+                      onSelect={(event) => selectNode(node, event)}
+                      onOpen={() => void openNode(node)}
+                      onToggle={() => toggleFolder(node)}
+                      onContextMenu={(event) => openContextMenu(event, node)}
+                    />
+                  ))
+                ) : (
+                  <div className="mosaic-grid">
+                    {visibleNodes.map(({ node }) => (
+                      <ExplorerTile
+                        key={node.path}
+                        node={node}
+                        expanded={expanded.has(node.path)}
+                        selected={selectedPaths.has(node.path)}
+                        clipboardMode={clipboard?.paths.includes(node.path) ? clipboard.operation : null}
+                        onSelect={(event) => selectNode(node, event)}
+                        onOpen={() => void openNode(node)}
+                        onToggle={() => toggleFolder(node)}
+                        onContextMenu={(event) => openContextMenu(event, node)}
+                      />
+                    ))}
+                  </div>
+                )
               ) : (
                 <div className="empty-state">
                   <FolderOpen size={42} />
@@ -820,6 +940,15 @@ function LibraryApp(): ReactElement {
               )}
             </div>
           </div>
+
+          <button
+            className="view-toggle-button"
+            type="button"
+            title={viewMode === 'tree' ? 'Passer en mosaique' : "Revenir a l'arborescence"}
+            onClick={() => setViewMode((current) => (current === 'tree' ? 'mosaic' : 'tree'))}
+          >
+            {viewMode === 'tree' ? 'Mosaique' : 'Liste'}
+          </button>
 
           <footer className="statusbar">
             <span>{status}</span>
@@ -1049,7 +1178,7 @@ function ViewerApp(): ReactElement {
     try {
       const canClose = await guardUnsaved()
       if (canClose) {
-        await window.photoDesk.closeViewer()
+        await window.photoDesk.closeViewer(currentPath ?? undefined)
       } else {
         await window.photoDesk.cancelViewerClose()
       }
@@ -1059,7 +1188,7 @@ function ViewerApp(): ReactElement {
     } finally {
       closeFlowRef.current = false
     }
-  }, [guardUnsaved])
+  }, [guardUnsaved, currentPath])
 
   async function go(delta: number): Promise<void> {
     if (!files.length) return
@@ -1232,17 +1361,15 @@ function ViewerApp(): ReactElement {
                   placeholder="prenom; groupe;"
                   onChange={(value) => updateField('peopleText', value)}
                 />
-                <label className="field-row">
+                <div className="field-row rating-field">
                   <span>Note</span>
-                  <input
-                    type="range"
-                    min="0"
-                    max="5"
+                  <StarRating
                     value={form.rating}
-                    onChange={(event) => updateField('rating', Number(event.target.value))}
+                    label="Note"
+                    onChange={(value) => updateField('rating', value)}
                   />
-                  <strong>{form.rating}</strong>
-                </label>
+                  <strong>{form.rating ? `${form.rating}/5` : 'Aucune note'}</strong>
+                </div>
                 <label className="check-row">
                   <input
                     type="checkbox"
@@ -1294,6 +1421,33 @@ function ViewerApp(): ReactElement {
   )
 }
 
+function SortHeaderButton({
+  field,
+  label,
+  sort,
+  onClick
+}: {
+  field: SortField
+  label: string
+  sort: SortState
+  onClick: (field: SortField) => void
+}): ReactElement {
+  const active = sort.field === field
+  const direction = active ? (sort.direction === 'asc' ? 'Asc' : 'Desc') : ''
+
+  return (
+    <button
+      className={`sort-header-button ${active ? 'active' : ''}`}
+      type="button"
+      aria-sort={active ? (sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'}
+      onClick={() => onClick(field)}
+    >
+      <span>{label}</span>
+      <small>{direction}</small>
+    </button>
+  )
+}
+
 function ExplorerRow(props: {
   node: FileNode
   depth: number
@@ -1335,9 +1489,116 @@ function ExplorerRow(props: {
       </div>
       <span>{formatDateShort(node.modifiedAt)}</span>
       <span>{kindLabel(node.kind, node.extension)}</span>
-      <span>{node.kind === 'folder' ? '' : formatBytes(node.size)}</span>
+      <span>{formatBytes(node.size)}</span>
     </div>
   )
+}
+
+function ExplorerTile(props: {
+  node: FileNode
+  expanded: boolean
+  selected: boolean
+  clipboardMode: 'copy' | 'cut' | null
+  onSelect: (event: MouseEvent) => void
+  onOpen: () => void
+  onToggle: () => void
+  onContextMenu: (event: MouseEvent) => void
+}): ReactElement {
+  const { node, expanded, selected, clipboardMode, onSelect, onOpen, onToggle, onContextMenu } = props
+  const hasChildren = node.kind === 'folder' && Boolean(node.children?.length)
+  const shouldLoadThumbnail = node.kind !== 'folder'
+  const { ref, thumbnail } = useLazyThumbnail(node.path, node.modifiedAt, shouldLoadThumbnail)
+
+  return (
+    <div
+      ref={ref}
+      className={`mosaic-tile ${selected ? 'selected' : ''} ${clipboardMode === 'cut' ? 'cut' : ''}`}
+      data-node-path={node.path}
+      onClick={onSelect}
+      onDoubleClick={onOpen}
+      onContextMenu={onContextMenu}
+    >
+      <div className="mosaic-preview">
+        {thumbnail ? <img src={thumbnail} alt="" draggable={false} /> : <KindIcon kind={node.kind} expanded={expanded} />}
+        {hasChildren ? (
+          <button
+            className="mosaic-folder-toggle"
+            type="button"
+            title={expanded ? 'Replier' : 'Deplier'}
+            onClick={(event) => {
+              event.stopPropagation()
+              onToggle()
+            }}
+          >
+            {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+          </button>
+        ) : null}
+      </div>
+      <div className="mosaic-meta">
+        <strong title={node.path}>{node.name}</strong>
+        <span>{kindLabel(node.kind, node.extension)}</span>
+        <small>
+          {formatBytes(node.size)} - {formatDateShort(node.modifiedAt)}
+        </small>
+      </div>
+    </div>
+  )
+}
+
+function useLazyThumbnail(
+  filePath: string,
+  thumbnailKey: string,
+  enabled: boolean
+): { ref: MutableRefObject<HTMLDivElement | null>; thumbnail: string | null } {
+  const ref = useRef<HTMLDivElement | null>(null)
+  const [visible, setVisible] = useState(!enabled)
+  const [thumbnail, setThumbnail] = useState<string | null>(null)
+
+  useEffect(() => {
+    setThumbnail(null)
+    setVisible(!enabled)
+  }, [enabled, filePath, thumbnailKey])
+
+  useEffect(() => {
+    if (!enabled || visible) return
+    const element = ref.current
+    if (!element || !('IntersectionObserver' in window)) {
+      setVisible(true)
+      return
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setVisible(true)
+          observer.disconnect()
+        }
+      },
+      { root: element.closest('.file-grid-body'), rootMargin: '220px' }
+    )
+
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [enabled, visible, filePath, thumbnailKey])
+
+  useEffect(() => {
+    if (!enabled || !visible) return
+    let cancelled = false
+    void window.photoDesk
+      .getThumbnail(filePath)
+      .then((result) => {
+        if (!cancelled) setThumbnail(result)
+      })
+      .catch(() => {
+        if (!cancelled) setThumbnail(null)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [enabled, visible, filePath, thumbnailKey])
+
+  return { ref, thumbnail }
 }
 
 function BulkMetadataMenuItem({
@@ -1622,7 +1883,7 @@ function PreviewPanel(props: {
 
       <InfoSection title="Fichier">
         <InfoRow label="Type" value={kindLabel(details.kind, details.extension)} />
-        <InfoRow label="Taille" value={details.kind === 'folder' ? '' : formatBytes(details.size)} />
+        <InfoRow label="Taille" value={formatBytes(details.size)} />
         <InfoRow label="Creation" value={formatDate(details.createdAt)} />
         <InfoRow label="Modification" value={formatDate(details.modifiedAt)} />
         <InfoRow label="Acces" value={formatDate(details.accessedAt)} />
@@ -1675,6 +1936,15 @@ function FilterBar({
   const update = <K extends keyof FilterState>(field: K, value: FilterState[K]): void => {
     onChange({ ...filters, [field]: value })
   }
+  const toggleEmptyFilter = (field: 'withoutTags' | 'withoutPeople' | 'withoutLocations', value: boolean): void => {
+    const clearedFields: Partial<FilterState> =
+      field === 'withoutTags'
+        ? { tagsText: '' }
+        : field === 'withoutPeople'
+          ? { peopleText: '' }
+          : { locationsText: '' }
+    onChange({ ...filters, ...clearedFields, [field]: value })
+  }
 
   return (
     <section className="filter-panel">
@@ -1717,7 +1987,7 @@ function FilterBar({
           icon={<Tag size={15} />}
           placeholder="voyage, famille..."
           multi
-          onChange={(value) => update('tagsText', value)}
+          onChange={(value) => onChange({ ...filters, tagsText: value, withoutTags: false })}
         />
 
         <AutocompleteTextField
@@ -1727,7 +1997,7 @@ function FilterBar({
           icon={<MapPin size={15} />}
           placeholder="Paris, Lyon..."
           multi
-          onChange={(value) => update('locationsText', value)}
+          onChange={(value) => onChange({ ...filters, locationsText: value, withoutLocations: false })}
         />
 
         <AutocompleteTextField
@@ -1737,7 +2007,7 @@ function FilterBar({
           icon={<Users size={15} />}
           placeholder="prenom, groupe..."
           multi
-          onChange={(value) => update('peopleText', value)}
+          onChange={(value) => onChange({ ...filters, peopleText: value, withoutPeople: false })}
         />
 
         <label className="filter-field">
@@ -1752,20 +2022,15 @@ function FilterBar({
           </select>
         </label>
 
-        <label className="filter-field rating-filter">
+        <div className="filter-field rating-filter">
           <span>Note min.</span>
-          <div className="rating-filter-row">
-            <Star size={15} />
-            <input
-              type="range"
-              min="0"
-              max="5"
-              value={filters.minRating}
-              onChange={(event) => update('minRating', Number(event.target.value))}
-            />
-            <strong>{filters.minRating}</strong>
-          </div>
-        </label>
+          <StarRating
+            value={filters.minRating}
+            label="Note minimum"
+            compact
+            onChange={(value) => update('minRating', value)}
+          />
+        </div>
 
         <label className="filter-check">
           <input
@@ -1775,6 +2040,36 @@ function FilterBar({
           />
           <Heart size={15} />
           Favoris
+        </label>
+
+        <label className="filter-check">
+          <input
+            type="checkbox"
+            checked={filters.withoutTags}
+            onChange={(event) => toggleEmptyFilter('withoutTags', event.target.checked)}
+          />
+          <Tag size={15} />
+          Pas de tag
+        </label>
+
+        <label className="filter-check">
+          <input
+            type="checkbox"
+            checked={filters.withoutLocations}
+            onChange={(event) => toggleEmptyFilter('withoutLocations', event.target.checked)}
+          />
+          <MapPin size={15} />
+          Pas de lieu
+        </label>
+
+        <label className="filter-check">
+          <input
+            type="checkbox"
+            checked={filters.withoutPeople}
+            onChange={(event) => toggleEmptyFilter('withoutPeople', event.target.checked)}
+          />
+          <Users size={15} />
+          Pas de personne
         </label>
       </div>
     </section>
@@ -2385,6 +2680,40 @@ function TextArea({
   )
 }
 
+function StarRating({
+  value,
+  label,
+  compact = false,
+  onChange
+}: {
+  value: number
+  label: string
+  compact?: boolean
+  onChange: (value: number) => void
+}): ReactElement {
+  return (
+    <div className={`star-rating ${compact ? 'compact' : ''}`} role="radiogroup" aria-label={label}>
+      {[1, 2, 3, 4, 5].map((rating) => {
+        const active = rating <= value
+        return (
+          <button
+            key={rating}
+            type="button"
+            className={active ? 'active' : ''}
+            role="radio"
+            aria-checked={value === rating}
+            title={rating === value ? 'Retirer la note' : `${rating}/5`}
+            onClick={() => onChange(rating === value ? 0 : rating)}
+          >
+            <Star size={compact ? 16 : 20} />
+          </button>
+        )
+      })}
+      <span>{value ? `${value}/5` : 'Aucune'}</span>
+    </div>
+  )
+}
+
 function IconButton({
   title,
   children,
@@ -2462,11 +2791,23 @@ function nodeMatchesFilters(node: FileNode, filters: FilterState): boolean {
     return false
   }
 
+  if (filters.withoutTags && (metadata.tags ?? []).length > 0) {
+    return false
+  }
+
   if (!matchesEveryToken(metadata.people ?? [], splitList(filters.peopleText))) {
     return false
   }
 
+  if (filters.withoutPeople && (metadata.people ?? []).length > 0) {
+    return false
+  }
+
   if (!matchesEveryToken(getMetadataLocations(metadata), splitList(filters.locationsText))) {
+    return false
+  }
+
+  if (filters.withoutLocations && getMetadataLocations(metadata).length > 0) {
     return false
   }
 
@@ -2492,7 +2833,10 @@ function hasMetadataFilters(filters: FilterState): boolean {
       filters.locationsText.trim() ||
       filters.status ||
       filters.minRating > 0 ||
-      filters.favoritesOnly
+      filters.favoritesOnly ||
+      filters.withoutTags ||
+      filters.withoutPeople ||
+      filters.withoutLocations
   )
 }
 
@@ -2506,6 +2850,9 @@ function countActiveFilters(filters: FilterState): number {
   if (filters.status) count += 1
   if (filters.minRating > 0) count += 1
   if (filters.favoritesOnly) count += 1
+  if (filters.withoutTags) count += 1
+  if (filters.withoutPeople) count += 1
+  if (filters.withoutLocations) count += 1
   return count
 }
 
@@ -2616,6 +2963,37 @@ function applyAutocompleteSuggestion(value: string, suggestion: string, multi: b
   return joinList(parts.map((part) => part.trim()).filter(Boolean))
 }
 
+function sortTree(root: FileNode, sort: SortState): FileNode {
+  const children = (root.children ?? []).map((child) => sortTree(child, sort)).sort((first, second) => compareNodes(first, second, sort))
+  return { ...root, children }
+}
+
+function compareNodes(first: FileNode, second: FileNode, sort: SortState): number {
+  const direction = sort.direction === 'asc' ? 1 : -1
+  const primary = compareByField(first, second, sort.field)
+  if (primary !== 0) return primary * direction
+  return first.name.localeCompare(second.name, 'fr', { sensitivity: 'base', numeric: true })
+}
+
+function compareByField(first: FileNode, second: FileNode, field: SortField): number {
+  if (field === 'modifiedAt') {
+    return new Date(first.modifiedAt).getTime() - new Date(second.modifiedAt).getTime()
+  }
+
+  if (field === 'kind') {
+    return kindLabel(first.kind, first.extension).localeCompare(kindLabel(second.kind, second.extension), 'fr', {
+      sensitivity: 'base',
+      numeric: true
+    })
+  }
+
+  if (field === 'size') {
+    return first.size - second.size
+  }
+
+  return first.name.localeCompare(second.name, 'fr', { sensitivity: 'base', numeric: true })
+}
+
 function flattenVisibleNodes(root: FileNode, expanded: Set<string>, depth = 0): Array<{ node: FileNode; depth: number }> {
   const rows = [{ node: root, depth }]
   if (root.kind === 'folder' && expanded.has(root.path)) {
@@ -2641,6 +3019,15 @@ function findNode(root: FileNode, targetPath: string): FileNode | null {
   for (const child of root.children ?? []) {
     const found = findNode(child, targetPath)
     if (found) return found
+  }
+  return null
+}
+
+function findNodeChain(root: FileNode, targetPath: string): FileNode[] | null {
+  if (root.path === targetPath) return [root]
+  for (const child of root.children ?? []) {
+    const found = findNodeChain(child, targetPath)
+    if (found) return [root, ...found]
   }
   return null
 }
@@ -2720,7 +3107,7 @@ function getBulkMetadataChanges(
 
 function scrollNodeIntoView(filePath: string): void {
   window.requestAnimationFrame(() => {
-    const row = Array.from(document.querySelectorAll<HTMLElement>('.file-row')).find(
+    const row = Array.from(document.querySelectorAll<HTMLElement>('.file-row, .mosaic-tile')).find(
       (element) => element.dataset.nodePath === filePath
     )
     row?.scrollIntoView({ block: 'nearest' })

@@ -43,7 +43,7 @@ contextBridge.exposeInMainWorld('photoDesk', {
   openViewer: (payload: { rootPath: string; files: string[]; currentPath: string }) =>
     ipcRenderer.invoke('viewer:open', payload),
   getViewerState: () => ipcRenderer.invoke('viewer:get-state'),
-  closeViewer: () => ipcRenderer.invoke('viewer:close'),
+  closeViewer: (currentPath?: string) => ipcRenderer.invoke('viewer:close', currentPath),
   cancelViewerClose: () => ipcRenderer.invoke('viewer:close-cancelled'),
   saveMediaEdits: (payload: unknown) => ipcRenderer.invoke('media:save-edits', payload),
   onChooseReferenceFolder: (callback: () => void) => on('app:choose-reference-folder', callback),
@@ -51,5 +51,6 @@ contextBridge.exposeInMainWorld('photoDesk', {
   onReferenceFolderSelected: (callback: (payload: { rootPath: string; tree: unknown }) => void) =>
     onPayload('app:reference-folder-selected', callback),
   onLibraryRefresh: (callback: () => void) => on('library:refresh', callback),
+  onLibrarySelectPath: (callback: (filePath: string) => void) => onPayload('library:select-path', callback),
   onViewerAttemptClose: (callback: () => void) => on('viewer:attempt-close', callback)
 })

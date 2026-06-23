@@ -1,6 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, shell } from 'electron'
 import type { IpcMainInvokeEvent, MenuItemConstructorOptions, MessageBoxOptions, OpenDialogOptions } from 'electron'
 import { spawn } from 'node:child_process'
+import type { Dirent } from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -957,6 +958,7 @@ function cleanMetadata(metadata: CustomMetadata): CustomMetadata {
 async function buildTree(rootPath: string): Promise<FileNode> {
   const stat = await fs.stat(rootPath)
   const metadataStore = await readMetadataStore(rootPath)
+  const children = await scanChildren(rootPath, rootPath, metadataStore)
   return {
     id: rootPath,
     path: rootPath,
@@ -964,10 +966,10 @@ async function buildTree(rootPath: string): Promise<FileNode> {
     name: path.basename(rootPath) || rootPath,
     extension: '',
     kind: 'folder',
-    size: stat.size,
+    size: children.reduce((total, child) => total + child.size, 0),
     createdAt: stat.birthtime.toISOString(),
     modifiedAt: stat.mtime.toISOString(),
-    children: await scanChildren(rootPath, rootPath, metadataStore)
+    children
   }
 }
 
@@ -981,6 +983,7 @@ async function scanChildren(directoryPath: string, rootPath: string, metadataSto
       const stat = await fs.stat(entryPath)
       const kind = getKind(entryPath, entry.isDirectory())
       const customMetadata = metadataStore[toStoreKey(rootPath, entryPath)]
+      const children = entry.isDirectory() ? await scanChildren(entryPath, rootPath, metadataStore) : undefined
       const node: FileNode = {
         id: entryPath,
         path: entryPath,
@@ -988,15 +991,13 @@ async function scanChildren(directoryPath: string, rootPath: string, metadataSto
         name: entry.name,
         extension: entry.isDirectory() ? '' : path.extname(entry.name).slice(1).toUpperCase(),
         kind,
-        size: stat.size,
+        size: children ? children.reduce((total, child) => total + child.size, 0) : stat.size,
         createdAt: stat.birthtime.toISOString(),
         modifiedAt: stat.mtime.toISOString(),
         customMetadata
       }
 
-      if (entry.isDirectory()) {
-        node.children = await scanChildren(entryPath, rootPath, metadataStore)
-      }
+      if (children) node.children = children
 
       return node
     })
@@ -1103,6 +1104,7 @@ async function getItemDetails(filePath: string, libraryRootPath: string | null =
   const kind = getKind(filePath, stat.isDirectory())
   const rootPath = libraryRootPath && isInside(filePath, libraryRootPath) ? libraryRootPath : null
   const media = kind === 'image' ? await getImageInfo(filePath) : kind === 'video' ? await getVideoInfo(filePath) : {}
+  const size = stat.isDirectory() ? await getDirectorySize(filePath) : stat.size
 
   return {
     id: filePath,
@@ -1111,7 +1113,7 @@ async function getItemDetails(filePath: string, libraryRootPath: string | null =
     name: path.basename(filePath),
     extension: stat.isDirectory() ? '' : path.extname(filePath).slice(1).toUpperCase(),
     kind,
-    size: stat.size,
+    size,
     createdAt: stat.birthtime.toISOString(),
     modifiedAt: stat.mtime.toISOString(),
     accessedAt: stat.atime.toISOString(),
@@ -1120,6 +1122,31 @@ async function getItemDetails(filePath: string, libraryRootPath: string | null =
     media,
     canRotate: kind === 'image' && rotatableImageExtensions.has(path.extname(filePath).toLowerCase())
   }
+}
+
+async function getDirectorySize(directoryPath: string): Promise<number> {
+  let entries: Dirent[]
+  try {
+    entries = await fs.readdir(directoryPath, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+
+  const sizes = await Promise.all(
+    entries
+      .filter((entry) => entry.name !== metadataDirName)
+      .map(async (entry) => {
+        const entryPath = path.join(directoryPath, entry.name)
+        try {
+          const stat = await fs.stat(entryPath)
+          return stat.isDirectory() ? getDirectorySize(entryPath) : stat.size
+        } catch {
+          return 0
+        }
+      })
+  )
+
+  return sizes.reduce((total, size) => total + size, 0)
 }
 
 async function getThumbnail(filePath: string): Promise<string | null> {
@@ -1644,8 +1671,18 @@ ipcMain.handle('viewer:get-state', async (event) => {
   return viewerStates.get(event.sender.id) ?? null
 })
 
-ipcMain.handle('viewer:close', async (event) => {
+ipcMain.handle('viewer:close', async (event, currentPath?: string) => {
   const win = BrowserWindow.fromWebContents(event.sender)
+  const state = viewerStates.get(event.sender.id)
+  const pathToSelect =
+    state && currentPath && isInside(currentPath, state.rootPath)
+      ? currentPath
+      : state?.currentPath
+
+  if (state && pathToSelect && isInside(pathToSelect, state.rootPath)) {
+    mainWindow?.webContents.send('library:select-path', pathToSelect)
+  }
+
   if (win) {
     viewerCloseAllowed.add(win.id)
     viewerClosePrompting.delete(win.id)
